@@ -1,0 +1,21 @@
+[package]
+name = "retrace"
+description = "Generic rollback log with background consolidation"
+repository = "https://github.com/chitoyuu/retrace"
+documentation = "https://docs.rs/retrace"
+authors = ["Chitose Yuuzaki <chitoyuu@potatoes.gay>"]
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition = "2018"
+readme = "README.md"
+keywords = ["intent", "rollback", "undo"]
+categories = ["data-structures"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+arc-swap = "1.4.0"
+
+[features]
+default = ["std"]
+std = []
