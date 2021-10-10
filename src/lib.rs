@@ -1,115 +1,267 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+#![forbid(unsafe_code)]
+#![doc = include_str!("../README.md")]
+#![cfg_attr(not(test), warn(clippy::pedantic))]
+#![allow(clippy::must_use_candidate, clippy::module_name_repetitions)]
 
 extern crate alloc;
 
-use core::marker::PhantomData;
-use core::slice::SliceIndex;
-use core::num::NonZeroUsize;
+use core::fmt::{self, Debug, Display};
+use core::mem::replace;
+use core::ops::Deref;
+use core::sync::atomic::{AtomicBool, Ordering};
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::{ArcSwap, ArcSwapOption, DefaultStrategy, Guard};
 
-/// A generic rollback log for any [`Reproducible`] type.
+mod options;
+
+/// Task spawners
+pub mod spawner;
+
+pub use options::Options;
+pub use spawner::{DefaultSpawner, Spawner};
+
+/// A generic rollback log for a [`Reproducible`] type.
+///
+/// The `Retrace` type is implemented as a lock-free linked list of flat chunks. To keep
+/// insertion latency predictable, it simply buffers them without applying them to a "tip"
+/// state, until there is enough intents for a chunk. It then builds the chunk, prepends
+/// it to the linked list, and in most cases spawns a background task to actually produce
+/// the state of the tip. Once completed, this result is atomically put back onto the list,
+/// without affecting existing readers and speeding up subsequent queries.
+///
+/// The type supports one writer and multiple concurrent readers.
+///
+/// This type may take an extra [`Spawner`] argument that is used to spawn background tasks.
+/// By default, [`DefaultSpawner`] is used.
 pub struct Retrace<T: Reproducible, R = DefaultSpawner> {
     options: Options,
     spawner: Arc<R>,
     pending: Vec<T::Intent>,
-    base: Base<T, R>,
+    base: Option<Arc<Base<T, R>>>,
+    housekeeping: AtomicBool,
 }
 
-impl<T: Reproducible, R: Spawner + Default> Retrace<T, R> {
-    pub fn new(state: T, options: &Options) -> Self {
-        Self::with_spawner(state, options, R::default())
+impl<T: Reproducible> Retrace<T, DefaultSpawner> {
+    /// Creates a new [`Retrace`] from a base state and a set of options, using the default
+    /// spawner.
+    pub fn new(state: T, options: Options) -> Self {
+        Self::with_spawner(state, options, DefaultSpawner::default())
     }
 }
 
 impl<T: Reproducible, R: Spawner> Retrace<T, R> {
-    pub fn with_spawner(state: T, options: &Options, spawner: R) -> Self {
+    /// Creates a new [`Retrace`] from a base state and a set of options, using a custom
+    /// spawner.
+    pub fn with_spawner(state: T, options: Options, spawner: R) -> Self {
+        let pending = Vec::with_capacity(options.chunk_size.get());
+
         Retrace {
-            options: options.clone(),
+            options,
             spawner: Arc::new(spawner),
-            pending: Vec::with_capacity(options.chunk_size.get()),
-            base: Base::Root(Arc::new(state)),
+            pending,
+            base: Some(Arc::new(Base::Root(Arc::new(state)))),
+            housekeeping: AtomicBool::new(false),
         }
     }
-}
 
-/// Options for creating a new instance of [`Retrace`].
-///
-/// This type supports builder-style methods. The default can be obtained using either
-/// [`Options::default`] or [`Options::new`]. The default values are subject to change between
-/// compatible versions.
-#[derive(Clone, Debug)]
-pub struct Options {
-    chunk_size: NonZeroUsize,
-    soft_limit: Option<usize>,
-    hard_limit: Option<usize>,
-}
+    /// Appends a single intent to the end of the log.
+    ///
+    /// Appending an intent to the log does not immediately evaluate it against a "tip"
+    /// state. As such, this method does not return a result. Should the appended intent
+    /// be invalid (i.e. `state.apply(intent).is_err()`), queries to all subsequent states
+    /// will return errors until one of the rollback methods is called to restore a known
+    /// good state.
+    ///
+    /// This operation runs in amortized `O(1)` time, and is not dependent on the time
+    /// needed to apply the intent.
+    pub fn append(&mut self, intent: T::Intent) {
+        self.pending.push(intent);
 
-impl Default for Options {
-    fn default() -> Self {
-        Options {
-            chunk_size: NonZeroUsize::new(32).unwrap(),
-            soft_limit: Some(256),
-            hard_limit: None,
+        let chunk_size = self.options.chunk_size.get();
+
+        if self.pending.len() == chunk_size {
+            let intents = replace(&mut self.pending, Vec::with_capacity(chunk_size));
+            let intents = intents.into_boxed_slice();
+
+            let base = self
+                .base
+                .take()
+                .expect("base is always put back after this");
+
+            let base_is_cached = base.is_cached();
+
+            let chunk = Chunk::new(intents, base, Arc::clone(&self.spawner));
+
+            if base_is_cached {
+                chunk.spawn_cache_task_if_not_spawned();
+            }
+
+            self.base = Some(Arc::new(Base::Chunk(chunk)));
+
+            self.housekeep();
         }
     }
+
+    /// Pops a single intent off the log, if there is any.
+    ///
+    /// This operation runs in amortized `O(1)` time.
+    pub fn pop(&mut self) -> Option<T::Intent> {
+        while self.pending.is_empty() {
+            if !matches!(self.base.as_deref(), Some(Base::Chunk(_))) {
+                return None;
+            }
+
+            let base = self.base.take();
+            let chunk = if let Some(Base::Chunk(chunk)) = base.as_deref() {
+                chunk
+            } else {
+                unreachable!()
+            };
+
+            self.pending = chunk.intents.to_vec();
+            self.base = Some(Arc::clone(&*chunk.base.load()));
+        }
+
+        self.pending.pop()
+    }
+
+    /// Returns the current length of the log.
+    ///
+    /// Finding out the length of the log requires walking through the (chunked) linked list,
+    /// which is asymptotically `O(n)`, but usually not too large given reasonable options of
+    /// `chunk_size` and `*_limit`.
+    ///
+    /// Note that by nature of concurrency, this value may become altered after this is called
+    /// by other procedures, such as [`Retrace::housekeep`].
+    pub fn len(&self) -> usize {
+        let mut current = RefOrGuard::Ref(self.base.as_ref().expect("base is set here"));
+        let mut len = 0;
+
+        while let Base::Chunk(chunk) = &*current {
+            len += chunk.len();
+            current = RefOrGuard::Guard(chunk.base.load());
+        }
+
+        self.pending.len() + len
+    }
+
+    /// Returns `true` if the log is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Evaluates the log up to `steps` until the end, and returns the result if in range.
+    ///
+    /// For larger `steps` values, this requires walking through the (chunked) linked list,
+    /// which is asymptotically `O(n)`, although the cost of this is likely to be dwarfed by
+    /// the costs of reconstructing the state from re-applying intents, even with a cached base
+    /// to start off from.
+    ///
+    /// # Errors
+    ///
+    /// - [`EvalError::OutOfRange`] if `steps` is out of range.
+    /// - [`EvalError::Internal`] if an error occurred during evaluation.
+    pub fn eval(&self, steps: usize) -> Result<T, EvalError<T::Error>> {
+        if steps <= self.pending.len() {
+            let base = self.base.as_ref().expect("base is set here");
+            let mut state = base.eval().map_err(EvalError::Internal)?;
+            state
+                .apply_all(&self.pending[0..(self.pending.len() - steps)])
+                .map_err(EvalError::Internal)?;
+            return Ok(state);
+        }
+
+        let mut current = RefOrGuard::Ref(self.base.as_ref().expect("base is set here"));
+        let mut steps = steps - self.pending.len();
+
+        while let Base::Chunk(chunk) = &*current {
+            if steps == 0 {
+                return chunk.eval_tail().map_err(EvalError::Internal);
+            } else if steps <= chunk.len() {
+                return chunk.eval(steps).map_err(EvalError::Internal);
+            }
+
+            steps -= chunk.len();
+            current = RefOrGuard::Guard(chunk.base.load());
+        }
+
+        Err(EvalError::OutOfRange)
+    }
+
+    /// Manually trigger housekeeping.
+    ///
+    /// The behavior of `housekeep()` is not specified, except that it will not cause memory
+    /// unsafety, and that it will not alter any intents stored under the capacity limit,
+    /// whichever is smaller among `soft_limit` and `hard_limit`.
+    pub fn housekeep(&self) {
+        if self
+            .housekeeping
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let soft_limit = match (self.options.soft_limit, self.options.hard_limit) {
+            (None, hard) => hard,
+            (Some(soft), None) => Some(soft),
+            (Some(soft), Some(hard)) => Some(soft.min(hard)),
+        };
+
+        let soft_limit = if let Some(soft_limit) = soft_limit {
+            soft_limit
+        } else {
+            return;
+        };
+
+        let hard_limit = self.options.hard_limit;
+
+        let mut current = RefOrGuard::Ref(self.base.as_ref().expect("base is set here"));
+        let mut len = self.pending.len();
+
+        while let Base::Chunk(chunk) = &*current {
+            len += chunk.len();
+
+            if hard_limit.map_or(false, |limit| len >= limit) {
+                chunk.force_unchain();
+                break;
+            } else if len >= soft_limit {
+                if chunk.unchain() {
+                    break;
+                }
+                chunk.spawn_cache_task_if_not_spawned();
+            } else if chunk.base.load().is_cached() {
+                chunk.spawn_cache_task_if_not_spawned();
+            }
+
+            current = RefOrGuard::Guard(chunk.base.load());
+        }
+
+        self.housekeeping.store(false, Ordering::Release);
+    }
 }
 
-impl Options {
-    /// Creates a new [`Options`] from defaults. Same as [`Options::default`].
-    pub fn new() -> Self {
-        Self::default()
-    }
+/// Error during evaluation.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum EvalError<E> {
+    /// The requested step is not contained in the range of the log.
+    OutOfRange,
+    /// Any error that happened during intent application.
+    Internal(E),
+}
 
-    /// Sets the chunk size for this instance. At most one extra copy of the state can be cached
-    /// every `chunk_size` logged intents. This value must be non-zero.
-    ///
-    /// The value of `chunk_size` represents a tradeoff between retrieval latency and memory
-    /// efficiency. On one hand, for large states and relatively inexpensive intents, you might
-    /// want a large `chunk_size` to avoid storing many copies of the state. On the other hand,
-    /// if the states are small and the intents are expensive, a smaller `chunk_size` might be
-    /// useful.
-    ///
-    /// The current default value is `32`.
-    pub fn chunk_size(&mut self, chunk_size: NonZeroUsize) -> &mut Self {
-        self.chunk_size = chunk_size;
-        self
-    }
-
-    /// Sets a soft limit on history capacity for this instance.
-    ///
-    /// [`Retrace`] instances can potentially grow to store any number of intents as memory
-    /// allows. In practice, you might only ever need to revert a small amount of intents from
-    /// the tip. A `soft_limit` value hints [`Retrace`] to consider dropping trailing chunks
-    /// opportunistically when the length of the log becomes longer than the number specified.
-    ///
-    /// [`Retrace`] will *never* block the calling thread to rebase to `soft_limit`. A
-    /// `soft_limit` may never do anything if background tasks are dropped with [`DropSpawner`].
-    /// See [`Options::hard_limit`] for a complement.
-    ///
-    /// The current default value is `None`.
-    pub fn soft_limit(&mut self, soft_limit: Option<usize>) -> &mut Self {
-        self.soft_limit = soft_limit;
-        self
-    }
-    /// Sets a hard limit on history capacity for this instance.
-    ///
-    /// Unlike `soft_limit`, [`Retrace`] *will* block the calling thread in order to rebase
-    /// whenever it accumulates extra capacity over `hard_limit`. This can cause regular spikes
-    /// in latency in [`Retrace::push`], depending on how expensive it is to evaluate new base
-    /// states.
-    ///
-    /// `hard_limit` is most useful when combined with a lower `soft_limit` that allows
-    /// [`Retrace`] to opportunistically truncate old states, which has a much more predictable
-    /// performance.
-    ///
-    /// The current default value is `None`.
-    pub fn hard_limit(&mut self, hard_limit: Option<usize>) -> &mut Self {
-        self.hard_limit = hard_limit;
-        self
+impl<E: Display> Display for EvalError<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutOfRange => write!(f, "the requested step is out of range"),
+            Self::Internal(e) => write!(f, "internal error: {}", e),
+        }
     }
 }
 
@@ -121,102 +273,107 @@ impl Options {
 /// the compiler. Failure to observe these invariants will not cause memory unsafety or panics,
 /// but can cause erratic, undesirable behavior.
 ///
-/// - For each value `a`, `a.clone()` is *functionally equivalent* for the use scenario.
+/// - For each value `a`, `a.clone()` is *functionally equivalent* to `a` for the use scenario.
 /// - For two values `a` and `b` that are *functionally equivalent*, `a.apply(&i)` and
 ///   `b.apply(&i)` for the same intent `i` return the same `Result` variant, and leave the two
 ///   values in *functionally equivalent* state if that variant is `Ok`.
+/// - The equivalency between any two values `a` and `b` is not affected by non-local state.
 pub trait Reproducible: 'static + Clone + Send + Sync {
     /// The intent that can be applied to this reproducible state.
-    type Intent: Send + Sync;
+    type Intent: Clone + Send + Sync;
 
-    /// The error type.
+    /// The error type. All errors are treated as equivalent and terminate evaluation immediately.
     type Error: Clone + Send + Sync;
 
     /// Applies `intent` to `self` and returns the result of the operation.
+    ///
+    /// # Errors
+    ///
+    /// Implementors may return an error if `intent` is invalid, or if any other error happened
+    /// during application. Returning any error from `apply` or `apply_all` short circuits
+    /// evaluation  immediately, and `apply` or `apple_all` will no longer be called on this
+    /// specific state again.
     fn apply(&mut self, intent: &Self::Intent) -> Result<(), Self::Error>;
-}
 
-/// The default task spawner used by [`Retrace`] if the parameter is omitted.
-///
-/// This is currently [`NativeSpawner`] if `std` is enabled, or [`DropSpawner`] if not.
-#[cfg(feature = "std")]
-pub type DefaultSpawner = NativeSpawner;
-
-/// The default task spawner used by [`Retrace`] if the parameter is omitted.
-///
-/// This is currently [`NativeSpawner`] if `std` is enabled, or [`DropSpawner`] if not.
-#[cfg(not(feature = "std"))]
-pub type DefaultSpawner = DropSpawner;
-
-/// Trait for any spawner that supports spawning an unsupervised background task.
-///
-/// [`Retrace`] only uses the spawner for non-essential tasks. It does not depend on the
-/// closures actually being run to function as expected. See [`DropSpawner`] for a spawner
-/// that simply drops everything passed to it.
-///
-/// The default spawner is available as the type alias [`DefaultSpawner`].
-pub trait Spawner: 'static + Send + Sync {
-    /// Spawns the task `f` on another thread
-    fn spawn<F>(&self, f: F)
+    /// Apply all intents in `it` to `self` in that order, and return the result of the operation.
+    ///
+    /// The default implementation calls [`Reproducible::apply`] repeatedly. Some types might be
+    /// able to provide efficient implementations, for example, if there is some startup or
+    /// finalization cost involved.
+    ///
+    /// # Errors
+    ///
+    /// Implementors may return an error if `intent` is invalid, or if any other error happened
+    /// during application. Returning any error from `apply` or `apply_all` short circuits
+    /// evaluation  immediately, and `apply` or `apple_all` will no longer be called on this
+    /// specific state again.
+    fn apply_all<'a, I>(&mut self, it: I) -> Result<(), Self::Error>
     where
-        F: 'static + FnOnce() + Send;
-}
-
-#[cfg(feature = "std")]
-pub use native_spawner::NativeSpawner;
-
-#[cfg(feature = "std")]
-mod native_spawner {
-    use super::Spawner;
-
-    /// A task spawner that delegates to [`std::thread::spawn`].
-    #[derive(Clone, Copy, Debug, Default)]
-    pub struct NativeSpawner {
-        _private: (),
-    }
-
-    impl Spawner for NativeSpawner {
-        fn spawn<F>(&self, f: F)
-        where
-            F: 'static + FnOnce() + Send,
-        {
-            std::thread::spawn(f);
-        }
-    }
-}
-
-/// A task "spawner" that simply drops the closure immediately on the current thread.
-///
-/// This can be used to disable all background tasks, when they are undesirable or if an actual
-/// spawner is unavailable.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DropSpawner {
-    _private: (),
-}
-
-impl Spawner for DropSpawner {
-    fn spawn<F>(&self, _f: F)
-    where
-        F: 'static + FnOnce() + Send,
+        I: IntoIterator<Item = &'a Self::Intent>,
     {
+        for intent in it {
+            self.apply(intent)?;
+        }
+
+        Ok(())
+    }
+}
+
+enum RefOrGuard<'a, T: Reproducible, R> {
+    Ref(&'a Base<T, R>),
+    Guard(Guard<Arc<Base<T, R>>, DefaultStrategy>),
+}
+
+impl<'a, T: Reproducible, R> Deref for RefOrGuard<'a, T, R> {
+    type Target = Base<T, R>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            RefOrGuard::Ref(r) => r,
+            RefOrGuard::Guard(r) => &**r,
+        }
     }
 }
 
 struct Chunk<T: Reproducible, R> {
     spawner: Arc<R>,
     cached_tail: Arc<ArcSwapOption<Result<Arc<T>, T::Error>>>,
-    intents: Box<[T::Intent]>,
+    cache_task_spawned: AtomicBool,
+    intents: Arc<[T::Intent]>,
     base: ArcSwap<Base<T, R>>,
 }
 
 impl<T: Reproducible, R: Spawner> Chunk<T, R> {
-    fn new(intents: Box<[T::Intent]>, base: Base<T, R>, spawner: Arc<R>) -> Self {
+    fn new(intents: Box<[T::Intent]>, base: Arc<Base<T, R>>, spawner: Arc<R>) -> Self {
         Chunk {
             spawner,
             cached_tail: Arc::new(ArcSwapOption::from_pointee(None)),
-            intents,
-            base: ArcSwap::from_pointee(base),
+            cache_task_spawned: AtomicBool::new(false),
+            intents: Arc::from(intents),
+            base: ArcSwap::new(base),
         }
+    }
+
+    fn spawn_cache_task_if_not_spawned(&self) {
+        if self
+            .cache_task_spawned
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let base = self.base.load();
+        let cached_tail = Arc::clone(&self.cached_tail);
+        let intents = Arc::clone(&self.intents);
+
+        self.spawner.spawn(move || {
+            let result = base.eval().and_then(move |mut state| {
+                state.apply_all(&*intents)?;
+                Ok(state)
+            });
+
+            cached_tail.store(Some(Arc::new(result.map(Arc::new))));
+        });
     }
 
     /// Unchain from this chunk if there is a cached base value available, making this chunk the new
@@ -282,7 +439,7 @@ impl<T: Reproducible, R: Spawner> Chunk<T, R> {
             };
         }
 
-        let result = self.eval(..);
+        let result = self.eval(0);
 
         self.cached_tail.compare_and_swap(
             cached,
@@ -295,15 +452,20 @@ impl<T: Reproducible, R: Spawner> Chunk<T, R> {
         result
     }
 
-    fn eval<I>(&self, range: I) -> Result<T, T::Error>
-    where
-        I: SliceIndex<[T::Intent], Output = [T::Intent]>,
-    {
+    /// Evaluate the current chunk up to `steps` until the end.
+    ///
+    /// # Panics
+    ///
+    /// If `steps` is larger than `intents.len()`
+    fn eval(&self, steps: usize) -> Result<T, T::Error> {
         let base = self.base.load();
         let mut state = base.eval()?;
-        for intent in &self.intents.as_ref()[range] {
-            state.apply(intent)?;
-        }
+
+        let intents = self.intents.as_ref();
+        assert!(steps <= intents.len());
+
+        state.apply_all(&intents[0..(intents.len() - steps)])?;
+
         Ok(state)
     }
 }
@@ -315,6 +477,13 @@ enum Base<T: Reproducible, R> {
 }
 
 impl<T: Reproducible, R: Spawner> Base<T, R> {
+    fn is_cached(&self) -> bool {
+        match self {
+            Base::Root(_) | Base::Error(_) => true,
+            Base::Chunk(chunk) => chunk.cached_tail.load().is_some(),
+        }
+    }
+
     fn eval(&self) -> Result<T, T::Error> {
         match self {
             Base::Root(t) => Ok(T::clone(t)),
@@ -328,11 +497,19 @@ impl<T: Reproducible, R: Spawner> Base<T, R> {
 mod tests {
     use super::*;
 
-    #[derive(Clone)]
+    use core::num::NonZeroUsize;
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
     struct Foo(i32);
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     enum Never {}
+
+    impl Display for Never {
+        fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            unreachable!()
+        }
+    }
 
     impl Reproducible for Foo {
         type Intent = i32;
@@ -351,5 +528,120 @@ mod tests {
         test::<Retrace<Foo, DefaultSpawner>>();
         test::<Chunk<Foo, DefaultSpawner>>();
         test::<Base<Foo, DefaultSpawner>>();
+    }
+
+    #[test]
+    fn basic_functions() {
+        const MAX: i32 = 100;
+
+        let mut retrace = Retrace::new(
+            Foo(0),
+            Options::new().chunk_size(NonZeroUsize::new(4).unwrap()),
+        );
+
+        for i in 1..=MAX {
+            retrace.append(i);
+        }
+
+        for _ in 0..MAX {
+            retrace.append(42);
+        }
+
+        for _ in 0..MAX {
+            assert_eq!(Some(42), retrace.pop());
+        }
+
+        for i in (1..=MAX).rev() {
+            assert_eq!(
+                Foo((1 + i) * i / 2),
+                retrace.eval((MAX - i) as usize).unwrap()
+            );
+        }
+
+        assert!(matches!(
+            retrace.eval((MAX + 1) as usize).unwrap_err(),
+            EvalError::OutOfRange
+        ));
+
+        for i in (1..=MAX).rev() {
+            assert_eq!(Some(i), retrace.pop());
+        }
+
+        assert_eq!(None, retrace.pop());
+    }
+
+    #[test]
+    fn backward_query() {
+        const MAX: i32 = 100;
+
+        let mut retrace = Retrace::new(
+            Foo(0),
+            Options::new().chunk_size(NonZeroUsize::new(4).unwrap()),
+        );
+
+        for i in 1..=MAX {
+            retrace.append(i);
+        }
+
+        for i in 1..=MAX {
+            assert_eq!(
+                Foo((1 + i) * i / 2),
+                retrace.eval((MAX - i) as usize).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn no_force_rebase_for_soft_limit() {
+        let mut retrace = Retrace::with_spawner(
+            Foo(0),
+            Options::new()
+                .chunk_size(NonZeroUsize::new(4).unwrap())
+                .soft_limit(Some(20)),
+            spawner::DropSpawner::default(),
+        );
+
+        for _ in 0..100 {
+            retrace.append(42);
+        }
+
+        assert_eq!(100, retrace.len());
+    }
+
+    #[test]
+    fn force_rebase_for_hard_limit() {
+        let mut retrace = Retrace::with_spawner(
+            Foo(0),
+            Options::new()
+                .chunk_size(NonZeroUsize::new(4).unwrap())
+                .hard_limit(Some(20)),
+            spawner::DropSpawner::default(),
+        );
+
+        for _ in 0..20 {
+            retrace.append(42);
+        }
+
+        for _ in 0..100 {
+            retrace.append(42);
+            assert!((20..=24).contains(&retrace.len()));
+        }
+    }
+
+    #[test]
+    fn deferred_rebase_for_soft_limit() {
+        let mut retrace = Retrace::with_spawner(
+            Foo(0),
+            Options::new()
+                .chunk_size(NonZeroUsize::new(4).unwrap())
+                .soft_limit(Some(20)),
+            spawner::ImmediateSpawner::default(),
+        );
+
+        for _ in 0..100 {
+            retrace.append(42);
+        }
+
+        assert!((20..=24).contains(&retrace.len()));
     }
 }
