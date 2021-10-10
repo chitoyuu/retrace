@@ -193,6 +193,143 @@ impl<T: Reproducible, R: Spawner> Retrace<T, R> {
         Err(EvalError::OutOfRange)
     }
 
+    /// Evaluates the "tip" state, and returns the result.
+    ///
+    /// This is equivalent to `retrace.eval(0)`.
+    ///
+    /// # Errors
+    ///
+    /// - [`EvalError::Internal`] if an error occurred during evaluation.
+    pub fn tip(&self) -> Result<T, EvalError<T::Error>> {
+        self.eval(0)
+    }
+
+    /// Attempt to find and go back to the last good state. Returns `Ok` if the current tip is
+    /// already valid.
+    ///
+    /// Trying to find where exactly the bad intent is necessarily involves computing a lot of
+    /// states, since [`Reproducible::apply`] only report the result *after* an intent is
+    /// applied. For expensive intents, this is thus a lot slower than
+    /// [`Retrace::rollback_chunk`] which only looks at cached results.
+    ///
+    /// # Errors
+    ///
+    /// If there is no good state to return to.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use retrace::{Retrace, Reproducible, Options};
+    ///
+    /// #[derive(Clone, PartialEq, Eq, Debug)]
+    /// struct Bar(i32);
+    ///
+    /// impl Reproducible for Bar {
+    ///     type Intent = i32;
+    ///     type Error = ();
+    ///
+    ///     fn apply(&mut self, intent: &Self::Intent) -> Result<(), Self::Error> {
+    ///         if *intent < 43 {
+    ///             self.0 = *intent;
+    ///             Ok(())
+    ///         } else {
+    ///             Err(())
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// let mut retrace = Retrace::new(Bar(0), Options::default());
+    ///
+    /// for i in 1..=100 {
+    ///     retrace.append(i);
+    /// }
+    ///
+    /// assert!(retrace.tip().is_err());
+    /// assert!(retrace.rollback().is_ok());
+    /// assert_eq!(Bar(42), retrace.tip().unwrap());
+    /// ```
+    pub fn rollback(&mut self) -> Result<(), RollbackFailure> {
+        if self.tip().is_ok() {
+            return Ok(());
+        }
+
+        let intents = self.rollback_chunk_inner()?;
+        let mut state = self.tip().unwrap_or_else(|_| {
+            unreachable!("rollback_chunk_inner should leave a valid tip or return Err")
+        });
+
+        for intent in intents {
+            let mut try_state = state.clone();
+            match try_state.apply(&intent) {
+                Ok(()) => {
+                    self.pending.push(intent);
+                    state = try_state;
+                }
+                Err(_) => {
+                    // Found the broken one
+                    break;
+                }
+            }
+        }
+
+        debug_assert!(self.tip().is_ok());
+        Ok(())
+    }
+
+    /// Attempt to find and go back to the last good state at the tail of a chunk. Returns `Ok`
+    /// if the current tip is already valid.
+    ///
+    /// This is a lot cheaper than `rollback` since it only has to compute the tip and look at
+    /// cached tail states, at the cost of losing any possibly valid intents in the next chunk.
+    ///
+    /// # Errors
+    ///
+    /// If there is no good state to return to.
+    pub fn rollback_chunk(&mut self) -> Result<(), RollbackFailure> {
+        if self.tip().is_ok() {
+            return Ok(());
+        }
+
+        self.rollback_chunk_inner().map(|_| ())
+    }
+
+    fn rollback_chunk_inner(&mut self) -> Result<Vec<T::Intent>, RollbackFailure> {
+        let mut current = RefOrGuard::Ref(self.base.as_ref().expect("base is set here"));
+        let mut previous = replace(
+            &mut self.pending,
+            Vec::with_capacity(self.options.chunk_size.get()),
+        );
+
+        while let Base::Chunk(chunk) = &*current {
+            let state = chunk.cached_tail.load();
+
+            if let Some(state) = &*state {
+                if state.is_ok() {
+                    match current {
+                        RefOrGuard::Ref(_) => {
+                            // Still the current thing in `self.base`, nothing to do
+                        }
+                        RefOrGuard::Guard(base) => {
+                            self.base = Some(Arc::clone(&*base));
+                        }
+                    }
+                    return Ok(previous);
+                }
+            }
+
+            previous = chunk.intents.to_vec();
+
+            current = RefOrGuard::Guard(chunk.base.load());
+        }
+
+        if let Base::Root(state) = &*current {
+            self.base = Some(Arc::new(Base::Root(Arc::new(T::clone(&*state)))));
+            return Ok(Vec::new());
+        }
+
+        Err(RollbackFailure { _private: () })
+    }
+
     /// Manually trigger housekeeping.
     ///
     /// The behavior of `housekeep()` is not specified, except that it will not cause memory
@@ -262,6 +399,18 @@ impl<E: Display> Display for EvalError<E> {
             Self::OutOfRange => write!(f, "the requested step is out of range"),
             Self::Internal(e) => write!(f, "internal error: {}", e),
         }
+    }
+}
+
+/// Error when there is no good state to roll back to.
+#[derive(Debug)]
+pub struct RollbackFailure {
+    _private: (),
+}
+
+impl Display for RollbackFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no good state could be found in the log")
     }
 }
 
@@ -502,18 +651,9 @@ mod tests {
     #[derive(Clone, PartialEq, Eq, Debug)]
     struct Foo(i32);
 
-    #[derive(Clone, Debug)]
-    enum Never {}
-
-    impl Display for Never {
-        fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            unreachable!()
-        }
-    }
-
     impl Reproducible for Foo {
         type Intent = i32;
-        type Error = Never;
+        type Error = ();
 
         fn apply(&mut self, intent: &Self::Intent) -> Result<(), Self::Error> {
             self.0 += *intent;
@@ -643,5 +783,92 @@ mod tests {
         }
 
         assert!((20..=24).contains(&retrace.len()));
+    }
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct Bar(i32);
+
+    impl Reproducible for Bar {
+        type Intent = Option<i32>;
+        type Error = ();
+
+        fn apply(&mut self, intent: &Self::Intent) -> Result<(), Self::Error> {
+            match intent {
+                Some(intent) => {
+                    self.0 += *intent;
+                    Ok(())
+                }
+                None => Err(()),
+            }
+        }
+    }
+
+    #[test]
+    fn can_rollback_chunk() {
+        let mut retrace = Retrace::new(
+            Bar(0),
+            Options::new().chunk_size(NonZeroUsize::new(4).unwrap()),
+        );
+
+        for _ in 0..22 {
+            retrace.append(Some(1));
+        }
+
+        retrace.append(None);
+
+        for _ in 0..22 {
+            retrace.append(Some(1));
+        }
+
+        assert!(retrace.tip().is_err());
+        retrace.rollback_chunk().unwrap();
+        assert_eq!(Bar(20), retrace.tip().unwrap());
+    }
+
+    #[test]
+    fn can_rollback_precise() {
+        let mut retrace = Retrace::new(
+            Bar(0),
+            Options::new().chunk_size(NonZeroUsize::new(4).unwrap()),
+        );
+
+        for _ in 0..22 {
+            retrace.append(Some(1));
+        }
+
+        retrace.append(None);
+
+        for _ in 0..22 {
+            retrace.append(Some(1));
+        }
+
+        assert!(retrace.tip().is_err());
+        retrace.rollback().unwrap();
+        assert_eq!(Bar(22), retrace.tip().unwrap());
+    }
+
+    #[test]
+    fn can_rollback_to_root() {
+        let mut retrace = Retrace::new(
+            Bar(0),
+            Options::new().chunk_size(NonZeroUsize::new(4).unwrap()),
+        );
+
+        retrace.append(None);
+
+        assert!(retrace.tip().is_err());
+        retrace.rollback().unwrap();
+        assert_eq!(Bar(0), retrace.tip().unwrap());
+
+        let mut retrace = Retrace::new(
+            Bar(0),
+            Options::new().chunk_size(NonZeroUsize::new(4).unwrap()),
+        );
+
+        retrace.append(None);
+
+        assert!(retrace.tip().is_err());
+        retrace.rollback_chunk().unwrap();
+        assert_eq!(Bar(0), retrace.tip().unwrap());
     }
 }

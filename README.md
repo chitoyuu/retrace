@@ -22,7 +22,6 @@ This crate is written with a use case with the following characteristics in mind
 # Example
 
 ```rust
-use core::fmt;
 use retrace::{Retrace, Reproducible, Options};
 
 // For the example, a simple integer is used as state. A real world example
@@ -30,18 +29,9 @@ use retrace::{Retrace, Reproducible, Options};
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct Foo(i32);
 
-#[derive(Clone, Debug)]
-enum Never {}
-
-impl fmt::Display for Never {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        unreachable!()
-    }
-}
-
 impl Reproducible for Foo {
     type Intent = i32;
-    type Error = Never;
+    type Error = ();
 
     fn apply(&mut self, intent: &Self::Intent) -> Result<(), Self::Error> {
         self.0 += *intent;
@@ -62,6 +52,7 @@ for i in (1..=100).rev() {
     );
 }
 ```
+
 
 # Features
 
