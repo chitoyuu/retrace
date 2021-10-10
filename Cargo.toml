@@ -16,6 +16,16 @@ categories = ["data-structures"]
 [dependencies]
 arc-swap = "1.4"
 
+[dev-dependencies]
+criterion = "0.3"
+rand = "0.8.4"
+
+[[bench]]
+name = "bench"
+harness = false
+required-features = ["bench"]
+
 [features]
 default = ["std"]
 std = []
+bench = []

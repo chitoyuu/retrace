@@ -11,7 +11,7 @@ The `Retrace` type is implemented as a lock-free linked list of flat chunks. To 
 
 This crate contains only safe code and declares `#[forbid(unsafe_code)]`.
 
-# Use cases
+## Use cases
 
 This crate is written with a use case with the following characteristics in mind:
 
@@ -19,7 +19,7 @@ This crate is written with a use case with the following characteristics in mind
 - Appends happen over time, instead of all at once.
 - It is fine to waste some CPU cycles, as long as it's not blocking the main thread.
 
-# Example
+## Example
 
 ```rust
 use retrace::{Retrace, Reproducible, Options};
@@ -54,6 +54,15 @@ for i in (1..=100).rev() {
 ```
 
 
-# Features
+## Features
 
 - `std`: **Enabled by default.** Sets `NativeSpawner` as the default `Spawner`. Disable this default feature for `no-std` support.
+
+## Benchmarks
+
+```sh
+$ cargo install cargo-criterion # if you haven't yet
+$ cargo criterion --features=bench
+```
+
+Because of how integral caching is to `retrace`, it's tricky to benchmark cold performance using only the public API. The `bench` feature provides the `Retrace::decache` method, which is used to benchmark cold query performance. This isn't very useful for any other purpose, and should not be used unless for benchmarking.

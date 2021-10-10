@@ -381,6 +381,19 @@ impl<T: Reproducible, R: Spawner> Retrace<T, R> {
 
         self.housekeeping.store(false, Ordering::Release);
     }
+
+    /// Method for benchmarking that removes cached values from all chunks. Necessary to test
+    /// cold query performance.
+    ///
+    /// **Not** useful for any purpose other than benchmarking.
+    #[cfg(feature = "bench")]
+    pub fn decache(&mut self) {
+        let mut current = RefOrGuard::Ref(self.base.as_ref().expect("base is set here"));
+        while let Base::Chunk(chunk) = &*current {
+            chunk.cached_tail.store(None);
+            current = RefOrGuard::Guard(chunk.base.load());
+        }
+    }
 }
 
 /// Error during evaluation.
