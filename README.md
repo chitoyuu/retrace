@@ -13,7 +13,7 @@ This crate contains only safe code and declares `#[forbid(unsafe_code)]`.
 
 ## Use cases
 
-This crate is written with a use case with the following characteristics in mind:
+This crate is written with a use case that has the following characteristics in mind, your milage may vary:
 
 - Appends must be fast, and should not have latency spikes.
 - Appends happen over time, instead of all at once.
